@@ -24,6 +24,8 @@ These apply to every session in this repo.
 
 **Teaching as you go.** After finishing a piece of work, explain what it does in plain language — the user is learning this material, not just shipping it. Explain the *why* behind design choices and name the gotchas hit along the way. This explanation is the point of the response, so it does not count as padding.
 
+**Commits.** The user commits and pushes; Claude does not run git commit. At the end of every phase, write out the commit message for the user to copy. Make it a real summary of what happened in the phase — design decisions, headline numbers, and bugs hit — not just a file list.
+
 **Written deliverables.** Match the length of written documents (README, design notes, benchmark writeups) to what the task needs: cover the substance, but do not pad with filler sections, redundant summaries, or boilerplate.
 
 **Task scope.** Deliver what was asked, at the scope intended. Make routine judgment calls yourself, and check in only when different readings of the request would lead to materially different work. If the request seems mistaken or a better approach exists, say so in a sentence and continue with the task as asked rather than quietly narrowing, widening, or transforming it. Finish the whole task, and stop short of actions clearly beyond what was asked.

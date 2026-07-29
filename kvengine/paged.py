@@ -186,10 +186,10 @@ class PagedSequenceCache:
             self._block_ids = torch.tensor(
                 self.blocks, dtype=torch.long, device=self.pool.device
             )
-        self._pending_slots = self._slot_indices(self._length, n_tokens)
+        self._pending_slots = self.slot_indices(self._length, n_tokens)
         self._pending_n = n_tokens
 
-    def _slot_indices(self, start: int, n_tokens: int) -> torch.Tensor:
+    def slot_indices(self, start: int, n_tokens: int) -> torch.Tensor:
         """Flat slot index for each logical position in [start, start+n).
 
         This translation is the whole idea of paging: logical position -> block

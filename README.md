@@ -15,16 +15,17 @@ model still works.
 | 0 | Manual decode loop, HuggingFace's cache object | done |
 | 1 | Own KV tensor, own attention math | done |
 | 2 | Paged block allocator + gather from scattered blocks | done |
-| 3 | Continuous batching (scheduler, waiting queue) | next |
-| 4 | Benchmark vs tuned HF baseline on a T4 | |
+| 3 | Continuous batching: scheduler, preemption, batched decode | done |
+| 4 | Benchmark vs tuned HF baseline on a T4 | next |
 | 5 | Speculative decoding | |
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest tests/ -q          # 54 tests
-.venv/bin/python scripts/phase2_demo.py       # the headline comparison
+.venv/bin/python -m pytest tests/ -q          # 72 tests
+.venv/bin/python scripts/phase2_demo.py       # memory: paging vs contiguous
+.venv/bin/python scripts/phase3_demo.py       # throughput: batched vs one-at-a-time
 ```
 
 ## The result so far
@@ -105,6 +106,52 @@ a forward pass, so growth cannot happen inside the layer loop and the length
 cannot advance until every layer is done. Getting this wrong slides the offset out
 from under layer 1.
 
+### Continuous batching (`engine.py`, `batch.py`)
+
+8 uneven requests, one pool, identical output:
+
+```
+one at a time:        6.17s   45.0 tok/s
+continuous batching:  4.45s   62.5 tok/s   (1.39x)
+avg decode batch 4.91 (max 8) | padding waste 15.3% | 0 preemptions
+```
+
+**The 1.39x is a CPU number and understates the point.** Batched decode wins by
+amortising the model weight read across requests, which pays off when decode is
+memory-bandwidth-bound — true on a GPU, much less true on a CPU where fp32
+matmuls are compute-bound. Phase 4 measures this properly on a T4.
+
+**The scheduling decision.** New requests need a prefill pass over the whole
+prompt; running requests need a one-token decode pass. They cannot share a
+forward pass without extra machinery, so the scheduler must pick an order:
+
+- `prefill_first` (default) minimises time-to-first-token, but each prefill stalls
+  every running request for a step, making inter-token latency spiky.
+  `max_prefills_per_step` bounds the damage.
+- `decode_first` gives smooth inter-token latency and the best decode throughput,
+  at the cost of new arrivals waiting behind long generations.
+
+Production engines dodge the dilemma with *chunked prefill*: split a long prompt
+into fixed-size pieces and mix one piece into a decode batch so neither side
+stalls. The correctness prerequisite already passes here
+(`test_incremental_prefill_equals_single_prefill`); what is missing is a forward
+pass accepting ragged prefill chunks and decode tokens together.
+
+**Preemption.** A decode step can fail to allocate when every running request
+wants one more slot and the pool is full. The scheduler frees the *most recently
+admitted* request's blocks and returns it to the queue, so older requests keep
+progressing (FCFS fairness). Its generated tokens are kept, and on re-admission
+the prompt plus those tokens are prefilled again to rebuild the cache. This is
+vLLM's recompute preemption — it costs a prefill but needs no extra memory, which
+is the right trade when memory is exactly what ran out. (vLLM's alternative is
+swapping blocks to host memory.) A test runs 4 requests through a 14-block pool
+and asserts preemption actually fires *and* that output is still byte-identical.
+
+Batched decode has one query token per request but a different history length per
+request, so gathered K/V is padded to the longest history in the batch and the
+padding masked out. Padding waste is reported (15.3% above) because it is the
+number that justifies grouping requests of similar length.
+
 ## Gotchas hit along the way
 
 **`.generate(do_sample=False)` is not pure argmax.** Qwen ships a
@@ -134,6 +181,24 @@ order make a broken gather look correct. One test fragments the pool first and
 asserts the block table is out of order *before* checking output; another forces a
 descending table to catch a gather that assumes ascending physical ids.
 
+**The resume boundary after preemption is off-by-one bait.** A resumed request
+must prefill prompt + generated[:-1], not prompt + generated: the last generated
+token has not yet been fed to the model, so including it would consume it twice
+and shift the whole output by one. The cache invariant is
+`length == prompt_len + len(generated) - 1`.
+
+**A prompt too large for the pool hung the scheduler.** Admission checked
+`needed > num_free` and broke out of the loop to wait — but for a prompt bigger
+than the entire pool, waiting can never help, so the loop spun forever with
+nothing running. Admission now rejects anything that would not fit in an *empty*
+pool, and `step()` carries a backstop that aborts the queue head when a step is
+idle with nothing running. Both are tested.
+
+**`padding_waste` depended on when it was called.** It derived history lengths
+from the live sequences, but `forward_decode_batch` commits, so the answer changed
+before vs after the forward pass. Lengths are now snapshotted at plan time. A
+metric that silently means two different things is worse than no metric.
+
 **HuggingFace Xet downloads hang on this machine.** Metadata comes from
 `huggingface.co` and works fine; only the weight file goes through Xet, so it
 presents as a silent 0-byte stall rather than an error. `loader.py` sets
@@ -151,6 +216,13 @@ version: correct, and slower by a constant. That constant is the 1.07x above.
 blocks. vLLM supports copy-on-write block sharing for exactly this; the block
 allocator here already tracks ownership, which is the hook that would need to
 become a reference count.
+
+**Decode batches are padded, not ragged.** vLLM's varlen kernels consume a ragged
+batch directly. Padding to the longest history wastes work proportional to the
+spread of lengths — measured at 15.3% on the demo workload.
+
+**No chunked prefill.** Prefill and decode occupy separate steps here, so a long
+prompt stalls decoding for a step. See the scheduling discussion above.
 
 **vLLM vs SGLang.** Both attack KV memory, differently. vLLM's paged attention
 solves *internal fragmentation* — dynamic sizing via a block table, waste bounded
@@ -172,11 +244,14 @@ kvengine/
   cache.py      phase 1: one contiguous buffer per request
   blocks.py     phase 2: the block allocator (no tensors)
   paged.py      phase 2: block-backed cache + scatter/gather
+  batch.py      phase 3: batched decode step (padded gather + mask)
+  engine.py     phase 3: scheduler, admission, preemption, metrics
 tests/
   test_phase0.py  exact match vs .generate()
   test_phase1.py  own cache, causal mask, chunked prefill
   test_blocks.py  allocator churn, OOM, double-ownership
   test_phase2.py  paged correctness, fragmentation, interleaved requests
+  test_phase3.py  batching invariance, ragged masks, preemption, rejection
 scripts/
-  phase0_demo.py / phase1_demo.py / phase2_demo.py
+  phase0_demo.py .. phase3_demo.py
 ```
