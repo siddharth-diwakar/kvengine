@@ -44,6 +44,7 @@ when memory is precisely what ran out.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -84,9 +85,43 @@ class Request:
     preemptions: int = 0
     prefill_tokens: int = 0  # includes tokens recomputed after preemption
 
+    # metrics, in wall-clock seconds. Steps are the right unit for reasoning about
+    # scheduling; seconds are the only unit a latency SLO is written in.
+    arrival_time: float = 0.0
+    first_token_time: float | None = None
+    finish_time: float | None = None
+
     @property
     def prompt_len(self) -> int:
         return len(self.prompt_token_ids)
+
+    @property
+    def ttft_s(self) -> float | None:
+        """Time to first token: what a user perceives as responsiveness."""
+        if self.first_token_time is None:
+            return None
+        return self.first_token_time - self.arrival_time
+
+    @property
+    def latency_s(self) -> float | None:
+        """End-to-end latency, arrival to last token."""
+        if self.finish_time is None:
+            return None
+        return self.finish_time - self.arrival_time
+
+    @property
+    def tpot_s(self) -> float | None:
+        """Time per output token after the first, i.e. inter-token latency.
+
+        Reported separately from TTFT because they trade off against each other
+        under different scheduling policies.
+        """
+        if self.first_token_time is None or self.finish_time is None:
+            return None
+        extra = len(self.output_token_ids) - 1
+        if extra <= 0:
+            return None
+        return (self.finish_time - self.first_token_time) / extra
 
     @property
     def next_token(self) -> int:
@@ -181,6 +216,7 @@ class Engine:
             max_new_tokens=max_new_tokens,
             eos_ids=_resolve_eos(self.model, eos_token_id),
             arrival_step=self.step_count,
+            arrival_time=time.perf_counter(),
         )
         self.waiting.append(req)
         return req
@@ -311,6 +347,7 @@ class Engine:
                 token = int(torch.argmax(logits[0, -1, :]))
                 req.output_token_ids.append(token)
                 req.first_token_step = self.step_count
+                req.first_token_time = time.perf_counter()
                 info.tokens_generated += 1
                 if req.is_done():
                     self._retire(req, req.done_reason(), info)
@@ -380,6 +417,7 @@ class Engine:
         req.state = RequestState.FINISHED
         req.finish_reason = reason
         req.finish_step = self.step_count
+        req.finish_time = time.perf_counter()
         if req in self.running:
             self.running.remove(req)
         self.finished.append(req)

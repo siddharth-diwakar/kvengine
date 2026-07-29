@@ -178,3 +178,28 @@ def test_causal_mask_with_history_offsets_queries():
 
 def test_causal_mask_skipped_for_single_decode_token():
     assert causal_mask(1, 99, torch.float32, torch.device("cpu")) is None
+
+
+def test_eager_and_sdpa_attention_agree(model, encode):
+    """The fused kernel and the spelled-out math must produce the same logits.
+
+    Both are used: SDPA by default for speed, eager as the readable reference. If
+    they ever diverge, the benchmark numbers stop meaning anything.
+    """
+    from kvengine import forward as fwd
+
+    ids = encode(PROMPTS[2])
+    original = fwd.USE_SDPA
+    try:
+        fwd.USE_SDPA = True
+        sdpa = greedy_own_cache(model, ids, max_new_tokens=8, eos_token_id=None,
+                                collect_logits=True)
+        fwd.USE_SDPA = False
+        eager = greedy_own_cache(model, ids, max_new_tokens=8, eos_token_id=None,
+                                 collect_logits=True)
+    finally:
+        fwd.USE_SDPA = original
+
+    assert sdpa.new_token_ids == eager.new_token_ids
+    max_diff = (sdpa.step_logits - eager.step_logits).abs().max().item()
+    assert max_diff < 1e-3, f"sdpa and eager attention disagree: {max_diff}"

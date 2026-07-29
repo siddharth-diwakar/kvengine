@@ -16,22 +16,22 @@ model still works.
 | 1 | Own KV tensor, own attention math | done |
 | 2 | Paged block allocator + gather from scattered blocks | done |
 | 3 | Continuous batching: scheduler, preemption, batched decode | done |
-| 4 | Benchmark vs tuned HF baseline on a T4 | next |
-| 5 | Speculative decoding | |
+| 4 | Scripted benchmark vs tuned HF baseline, results in JSON | done (T4 run pending) |
+| 5 | Speculative decoding | next |
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest tests/ -q          # 72 tests
+.venv/bin/python -m pytest tests/ -q          # 89 tests
 .venv/bin/python scripts/phase2_demo.py       # memory: paging vs contiguous
 .venv/bin/python scripts/phase3_demo.py       # throughput: batched vs one-at-a-time
+.venv/bin/python scripts/benchmark.py --requests 24 --out results/local.json
 ```
 
-## The result so far
+## The results so far
 
-Same memory budget, same model, same output. The only difference is how the KV
-cache is laid out.
+**Memory.** Same budget, same model, same output; only the cache layout differs.
 
 ```
 budget: 288 MiB   (= 6 contiguous requests reserving 2048 slots each)
@@ -40,6 +40,57 @@ budget: 288 MiB   (= 6 contiguous requests reserving 2048 slots each)
 contiguous              2.4%                      6
 paged                  87.8%                    192   (32x)
 ```
+
+**End to end vs a tuned HuggingFace baseline.** 24 requests fired at once,
+lognormal lengths, Qwen2.5-0.5B fp32 on an M4 Pro (MPS). Baseline is static
+batching, length-sorted, batch 16 — see [the benchmark section](#benchmark-benchpy-scriptsbenchmarkpy)
+for why that is a fair fight.
+
+```
+                        huggingface     kvengine
+wall                         17.51s       15.53s
+output tok/s                  170.4        192.1     1.13x
+cache utilization             56.9%        94.3%     1.66x
+p90 latency                  17.51s       13.32s
+p90 time-to-first-token      11.90s        5.88s
+p99 inter-token latency       0.347s       0.075s    4.6x
+```
+
+On a prompt-heavy workload (mean prompt 128, mean output 64) throughput is a wash
+and the latency picture is the same shape:
+
+```
+                        huggingface     kvengine
+output tok/s                  119.9        120.9     1.01x
+cache utilization             58.7%        96.6%     1.65x
+p90 latency                  16.83s       14.95s
+p90 time-to-first-token      10.79s        7.77s
+p99 inter-token latency       0.484s       0.158s    3.1x
+```
+
+Throughput parity here is expected and is the clearest remaining weakness: my
+prefill is per-request while HuggingFace prefills a whole batch of prompts in one
+pass, so the more prompt-heavy the workload, the more that costs.
+
+The throughput gain is modest (1.13x, or nil when prompt-heavy) but the **tail
+latency difference is large**, and that is the more honest headline. Static batching makes a request
+wait for its whole batch: the baseline's p90 TTFT is 11.9s because requests in the
+second batch sit idle until the first batch's longest member finishes. Continuous
+batching admits them as slots free up.
+
+The p99 inter-token latency gap (4.6x) is the same effect from the user's side: in
+a static batch, as sequences finish, the batch keeps running at full width with
+mostly-dead rows, so per-token time degrades. Here, finished requests leave.
+
+**These are CPU/MPS numbers on a 0.5B model, and they understate the throughput
+case.** Batched decode wins by amortising the weight read across requests, which
+pays off when decode is memory-bandwidth-bound — true on a GPU, much less true for
+fp32 matmuls on Apple silicon. The memory win (1.66x utilization here, 32x
+concurrency in the phase 2 microbenchmark) is what converts to throughput on real
+hardware, because it is what lets you run the larger batch in the first place.
+
+Raw results with full per-request records are in `results/`. The fp16 code path is
+smoke-tested; T4 numbers pending an actual T4.
 
 Utilization is the fraction of reserved cache memory actually holding real
 tokens. The contiguous scheme must reserve for the worst case *before* it knows
@@ -152,6 +203,36 @@ request, so gathered K/V is padded to the longest history in the batch and the
 padding masked out. Padding waste is reported (15.3% above) because it is the
 number that justifies grouping requests of similar length.
 
+### Benchmark (`bench.py`, `scripts/benchmark.py`)
+
+Scripted, not notebook-interactive, and device-agnostic so the same command
+produces the local numbers and the T4 numbers. Results are written to JSON under
+`results/`, tagged with device, dtype, library versions and git commit.
+
+```bash
+# local
+python scripts/benchmark.py --requests 24 --prompt-mean 32 --output-mean 96 \
+    --blocks 512 --max-batch-size 16 --baseline-batch-size 16 \
+    --out results/benchmark_mps_decode_heavy.json
+
+# Kaggle T4 (fp16)
+python scripts/benchmark.py --device cuda --dtype float16 \
+    --requests 128 --prompt-mean 256 --output-mean 128 \
+    --blocks 2048 --max-batch-size 32 --baseline-batch-size 32 \
+    --out results/benchmark_t4.json
+```
+
+**What makes the baseline a fair fight.** Comparing against one-at-a-time
+`.generate()` would be a strawman, so the baseline gets fp16, static batching, and
+length-sorted batches to minimise padding. What it structurally cannot do is
+refill a slot when a request finishes early — a static batch runs until its
+longest member is done. That gap is what continuous batching closes, and it should
+show up in the numbers rather than be asserted.
+
+Workload lengths are lognormal, not uniform: real traffic is right-skewed, and the
+*spread* is what drives padding waste and preemption. A uniform workload would
+hide exactly the behaviour being measured. Fixed seed, so runs are comparable.
+
 ## Gotchas hit along the way
 
 **`.generate(do_sample=False)` is not pure argmax.** Qwen ships a
@@ -199,6 +280,24 @@ from the live sequences, but `forward_decode_batch` commits, so the answer chang
 before vs after the forward pass. Lengths are now snapshotted at plan time. A
 metric that silently means two different things is worse than no metric.
 
+**I was benchmarking my eager attention against HuggingFace's fused kernel.**
+The first benchmark run showed my engine at **0.61x** the baseline's throughput.
+The cause was not paging: HuggingFace dispatches attention to PyTorch's fused
+SDPA kernel while I had hand-written the matmul/softmax/matmul. Switching the
+attention core to SDPA — keeping the paged gather exactly as it was — moved it to
+1.15x on the same workload. The eager path is still there behind
+`KVENGINE_EAGER_ATTN=1` as the readable reference, and a test asserts the two
+agree to 1e-3. Lesson: an unfair comparison hides the thing you are trying to
+measure just as effectively as a wrong one.
+
+**My benchmark harness was quietly cheating in the baseline's favour.** Baseline
+TTFT and latency were measured from each *batch's* start, while the engine measured
+from request arrival. With all requests arriving at t=0, a request in batch 3 has
+genuinely been waiting since t=0, so timing it from its own batch start erased the
+baseline's entire queueing delay — it reported a p90 TTFT of 0.34s where the honest
+number was 11.9s. Both sides now time from t0, and a test asserts that requests in
+later batches report larger latencies than those in the first.
+
 **HuggingFace Xet downloads hang on this machine.** Metadata comes from
 `huggingface.co` and works fine; only the weight file goes through Xet, so it
 presents as a silent 0-byte stall rather than an error. `loader.py` sets
@@ -224,6 +323,12 @@ spread of lengths — measured at 15.3% on the demo workload.
 **No chunked prefill.** Prefill and decode occupy separate steps here, so a long
 prompt stalls decoding for a step. See the scheduling discussion above.
 
+**Prefill is not batched.** Each admitted request gets its own prefill forward
+pass, while HuggingFace prefills a whole batch of prompts at once. On
+prompt-heavy workloads that is a real disadvantage and it shows in TTFT. It was a
+deliberate simplification — batching ragged prompts needs the same varlen
+machinery chunked prefill needs — but it is the clearest remaining throughput gap.
+
 **vLLM vs SGLang.** Both attack KV memory, differently. vLLM's paged attention
 solves *internal fragmentation* — dynamic sizing via a block table, waste bounded
 by one block per request. SGLang's RadixAttention solves *redundant computation* —
@@ -246,12 +351,15 @@ kvengine/
   paged.py      phase 2: block-backed cache + scatter/gather
   batch.py      phase 3: batched decode step (padded gather + mask)
   engine.py     phase 3: scheduler, admission, preemption, metrics
+  bench.py      phase 4: workload generator, tuned HF baseline, metrics
+results/        phase 4: committed benchmark JSON, one file per run
 tests/
   test_phase0.py  exact match vs .generate()
   test_phase1.py  own cache, causal mask, chunked prefill
   test_blocks.py  allocator churn, OOM, double-ownership
   test_phase2.py  paged correctness, fragmentation, interleaved requests
   test_phase3.py  batching invariance, ragged masks, preemption, rejection
+  test_phase4.py  workload determinism, percentile maths, baseline accounting
 scripts/
-  phase0_demo.py .. phase3_demo.py
+  phase0_demo.py .. phase3_demo.py, benchmark.py
 ```

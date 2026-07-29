@@ -16,9 +16,15 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import os
+
 import torch
 
 from .cache import ContiguousKVCache
+
+# Use PyTorch's fused attention kernel by default. Set KVENGINE_EAGER_ATTN=1 to
+# force the spelled-out path, which the tests use to prove the two agree.
+USE_SDPA = os.environ.get("KVENGINE_EAGER_ATTN", "0") != "1"
 
 
 class KVCacheLike(Protocol):
@@ -103,14 +109,32 @@ def attend(
     k: torch.Tensor,
     v: torch.Tensor,
     mask: torch.Tensor | None,
+    use_sdpa: bool | None = None,
 ) -> torch.Tensor:
-    """Scaled dot-product attention, written out by hand.
+    """Scaled dot-product attention over gathered K/V.
 
     q: [B, n_q_heads, T, D];  k/v: [B, n_kv_heads, kv_len, D]
     returns [B, T, n_q_heads, D]
+
+    Two implementations of the same math. The eager one spells out every step and
+    is the reference; the SDPA one dispatches to PyTorch's fused kernel.
+
+    The fused path matters for honest benchmarking, not just speed: HuggingFace's
+    baseline uses SDPA, so measuring hand-rolled eager attention against it would
+    conflate "paging costs throughput" with "my attention core is unoptimised".
+    Paging lives in how K/V is *gathered*, which is unchanged either way.
     """
+    if use_sdpa is None:
+        use_sdpa = USE_SDPA
+
     k = repeat_kv(k, attn_module.num_key_value_groups)
     v = repeat_kv(v, attn_module.num_key_value_groups)
+
+    if use_sdpa:
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, scale=attn_module.scaling
+        )
+        return out.transpose(1, 2).contiguous()
 
     scores = torch.matmul(q, k.transpose(2, 3)) * attn_module.scaling
     if mask is not None:
