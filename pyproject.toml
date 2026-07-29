@@ -1,4 +1,8 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --strict-markers"
+markers = [
+    "fast: pure logic, no model weights or tokenizer needed (runs in under a second)",
+    "slow: needs downloaded weights or a tokenizer",
+]

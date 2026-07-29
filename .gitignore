@@ -1,3 +1,8 @@
+# Local agent instructions, kept out of the repo. Both spellings, since macOS is
+# case-insensitive but gitignore matching is not.
+CLAUDE.md
+Claude.MD
+
 .venv/
 __pycache__/
 *.py[cod]

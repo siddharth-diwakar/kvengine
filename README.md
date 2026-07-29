@@ -1,5 +1,7 @@
 # kvengine
 
+[![ci](https://github.com/siddharth-diwakar/kvengine/actions/workflows/ci.yml/badge.svg)](https://github.com/siddharth-diwakar/kvengine/actions/workflows/ci.yml)
+
 A small LLM inference engine built from scratch, to understand how production
 serving engines actually work. Target model is Qwen2.5-0.5B; everything runs on a
 Mac (CPU or MPS) and is meant to port to a T4 for benchmarking.
@@ -23,7 +25,8 @@ model still works.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest tests/ -q          # 89 tests
+.venv/bin/python -m pytest -m fast            # 24 tests, no weights, 0.05s
+.venv/bin/python -m pytest                    # 107 tests, ~2.5 min
 .venv/bin/python scripts/phase2_demo.py       # memory: paging vs contiguous
 .venv/bin/python scripts/phase3_demo.py       # throughput: batched vs one-at-a-time
 .venv/bin/python scripts/benchmark.py --requests 24 --out results/local.json
@@ -314,6 +317,29 @@ Wall-clock speedup peaks at k=4 because acceptance falls as the speculation runs
 further from the target's distribution while drafting cost grows linearly. Report
 only the first and speculative decoding always looks like it is winning — see the
 self-draft entry under gotchas for the extreme case.
+
+### Testing and CI
+
+Tests are tagged `fast` or `slow` automatically, derived from whether a test
+requests a fixture that needs downloaded weights. Deriving it beats hand-annotating:
+a new test classifies itself, and one can never drift into the fast suite and start
+silently downloading a model there.
+
+```bash
+pytest -m fast   # 24 tests: allocator invariants, percentile maths, mask geometry
+pytest           # 107 tests
+```
+
+CI runs three things ([workflow](.github/workflows/ci.yml)):
+
+1. **fast suite on Python 3.12 and 3.13** — every push, finishes in seconds
+2. **full suite** — weights restored from cache, so the 1 GB download happens once
+3. **the exact-match anchors again on the unfused attention path** — the project
+   ships both a fused SDPA kernel and a spelled-out reference, and the benchmark
+   numbers only mean something if they agree
+
+CI installs torch from PyTorch's CPU index: the default PyPI Linux wheel bundles
+CUDA and is ~2.5 GB against ~200 MB for CPU-only.
 
 ## Gotchas hit along the way
 
