@@ -129,6 +129,19 @@ class ContiguousKVCache:
         v_all = self.v[layer_idx, :, :end, :].unsqueeze(0)
         return k_all, v_all
 
+    def truncate(self, n_tokens: int) -> None:
+        """Roll the cache back to n_tokens, discarding everything after it.
+
+        Speculative decoding needs this: the target model writes K/V for every
+        drafted token, then rejects some of them. Those entries must be dropped or
+        the next pass would attend to tokens that were never really generated.
+
+        Nothing is zeroed, same as reset(): positions past `length` are never read.
+        """
+        if not 0 <= n_tokens <= self._length:
+            raise ValueError(f"cannot truncate to {n_tokens}, length is {self._length}")
+        self._length = n_tokens
+
     def commit(self, n_tokens: int) -> None:
         """Advance the length once per forward pass, after every layer has written.
 

@@ -17,7 +17,7 @@ model still works.
 | 2 | Paged block allocator + gather from scattered blocks | done |
 | 3 | Continuous batching: scheduler, preemption, batched decode | done |
 | 4 | Scripted benchmark vs tuned HF baseline, results in JSON | done (T4 run pending) |
-| 5 | Speculative decoding | next |
+| 5 | Speculative decoding: 0.5B draft for a 3B target | done |
 
 ## Quickstart
 
@@ -27,7 +27,13 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/phase2_demo.py       # memory: paging vs contiguous
 .venv/bin/python scripts/phase3_demo.py       # throughput: batched vs one-at-a-time
 .venv/bin/python scripts/benchmark.py --requests 24 --out results/local.json
+.venv/bin/python scripts/phase5_demo.py --dtype float16   # spec decoding k-sweep
 ```
+
+The Phase 5 sweep downloads Qwen2.5-3B (~6 GB). Pass
+`--target Qwen/Qwen2.5-0.5B --draft Qwen/Qwen2.5-0.5B` to exercise the code path
+with no extra download; acceptance will be 100% and it will be slower, for the
+reason in the gotchas.
 
 ## The results so far
 
@@ -91,6 +97,28 @@ hardware, because it is what lets you run the larger batch in the first place.
 
 Raw results with full per-request records are in `results/`. The fp16 code path is
 smoke-tested; T4 numbers pending an actual T4.
+
+**Speculative decoding.** Qwen2.5-0.5B drafting for Qwen2.5-3B (6.2x parameter
+ratio), fp16 on MPS, 6 prompts x 64 tokens. Every run is token-identical to plain
+greedy on the 3B target.
+
+```
+  k    tok/s   speedup   accept   tok/target-pass   all-k iters
+ --     21.8     1.00x        -              1.00             -
+  1     25.8     1.19x    82.5%              1.81         82.5%
+  2     32.9     1.51x    76.6%              2.49         69.5%
+  4     35.2     1.61x    64.7%              3.52         53.2%
+  8     29.4     1.35x    48.3%              4.68         26.8%
+```
+
+**k=4 is the optimum, and k=8 is worse than k=2.** The curve is non-monotonic
+because k trades two things against each other: more drafted tokens means more
+tokens per target pass (1.81 → 4.68, monotonically better) but a longer speculation
+runs further from the target's own distribution, so acceptance falls (82.5% →
+48.3%) while drafting cost grows linearly in k. At k=8 more than half of every
+draft is thrown away, and the draft passes that produced it are pure waste. The
+fraction of iterations where *all* k are accepted collapses from 82.5% to 26.8%,
+which is the clearest single indicator of where the knee is.
 
 Utilization is the fraction of reserved cache memory actually holding real
 tokens. The contiguous scheme must reserve for the worst case *before* it knows
@@ -233,6 +261,60 @@ Workload lengths are lognormal, not uniform: real traffic is right-skewed, and t
 *spread* is what drives padding waste and preemption. A uniform workload would
 hide exactly the behaviour being measured. Fixed seed, so runs are comparable.
 
+### Speculative decoding (`speculative.py`)
+
+Decode is memory-bandwidth-bound: producing one token requires reading every
+weight in the model, so the arithmetic units idle. Speculative decoding fills them.
+A small draft model proposes k tokens cheaply, then the target checks all k **in a
+single forward pass** — verifying k tokens is one pass over k positions, which costs
+barely more than one pass over one position. Every accepted token is a token the
+target never generated serially.
+
+**The guarantee is exact.** Greedy speculative decoding produces byte-identical
+output to plain greedy decoding of the target. The draft affects speed only: a
+token is accepted precisely when the target would have picked it anyway, and the
+first disagreement is resolved in the target's favour. A useless draft makes this
+*slower*; it cannot make it *wrong*.
+
+That property is what makes the phase testable without any large model, and it is
+how the tests are built:
+
+- **self-draft** (draft == target): every proposal is what the target would choose,
+  so acceptance is 100% and output is unchanged.
+- **hostile draft**: a wrapper that rolls the vocabulary axis of the final logits so
+  its argmax is deliberately wrong. Acceptance collapses to ~0% and output is
+  **still** unchanged.
+
+Both hold for k ∈ {1, 2, 4, 8}, which pins the algorithm down regardless of which
+models get plugged in later.
+
+**Positions, precisely.** With `u` tokens the target has not yet seen and k drafts,
+the target is fed `u + k` tokens. Logits at index i predict the token *after* input
+i, so index `u-1` predicts `drafts[0]` (it is the last real token), index `u-1+j`
+predicts `drafts[j]`, and index `u-1+k` is a bonus prediction after the last draft.
+That is k+1 predictions from one pass: k to check, plus a free token if all k are
+accepted. An iteration therefore yields between 1 and k+1 tokens.
+
+**Cache rollback is the real work.** The target writes K/V for every drafted token
+before it knows which are good, so rejected entries must be discarded or the next
+pass attends to tokens that were never generated. Both caches also drift out of
+sync with the accepted sequence at different rates, so each iteration begins by
+feeding whatever that cache has not seen. Off-by-one here produces output that is
+subtly wrong rather than obviously broken.
+
+`truncate()` on the paged cache is where paging pays off a second time: rolling
+back rejected tokens is just handing whole blocks back to the pool. A contiguous
+cache would keep the entire reservation regardless. A test drives a hostile draft
+at k=8 through a 64-block pool and asserts the block count tracks the *accepted*
+length, not the speculative high-water mark.
+
+**Choosing k.** Two metrics are needed and they disagree, which is the point.
+`tokens_per_target_forward` measures the *mechanism* and rises monotonically with k.
+Wall-clock speedup peaks at k=4 because acceptance falls as the speculation runs
+further from the target's distribution while drafting cost grows linearly. Report
+only the first and speculative decoding always looks like it is winning — see the
+self-draft entry under gotchas for the extreme case.
+
 ## Gotchas hit along the way
 
 **`.generate(do_sample=False)` is not pure argmax.** Qwen ships a
@@ -298,6 +380,16 @@ baseline's entire queueing delay — it reported a p90 TTFT of 0.34s where the h
 number was 11.9s. Both sides now time from t0, and a test asserts that requests in
 later batches report larger latencies than those in the first.
 
+**Self-draft speculative decoding is correct and 2.5x slower.** Running the 0.5B
+model as its own draft gives 100% acceptance and 4.57 tokens per target forward at
+k=4 — the target does 4.6x fewer serial passes — yet wall-clock throughput drops to
+0.61x. Nothing is broken: when the draft costs as much as the target, producing k+1
+tokens burns k+1 *target-sized* forwards, so the pass count you saved is exactly the
+pass count you spent drafting. It is a clean demonstration that
+tokens-per-target-forward measures the *mechanism* while speedup depends entirely
+on the draft being cheap. Reporting only the flattering metric would have hidden
+that.
+
 **HuggingFace Xet downloads hang on this machine.** Metadata comes from
 `huggingface.co` and works fine; only the weight file goes through Xet, so it
 presents as a silent 0-byte stall rather than an error. `loader.py` sets
@@ -352,7 +444,8 @@ kvengine/
   batch.py      phase 3: batched decode step (padded gather + mask)
   engine.py     phase 3: scheduler, admission, preemption, metrics
   bench.py      phase 4: workload generator, tuned HF baseline, metrics
-results/        phase 4: committed benchmark JSON, one file per run
+  speculative.py phase 5: draft/verify loop with cache rollback
+results/        phases 4-5: committed benchmark JSON, one file per run
 tests/
   test_phase0.py  exact match vs .generate()
   test_phase1.py  own cache, causal mask, chunked prefill
@@ -360,6 +453,7 @@ tests/
   test_phase2.py  paged correctness, fragmentation, interleaved requests
   test_phase3.py  batching invariance, ragged masks, preemption, rejection
   test_phase4.py  workload determinism, percentile maths, baseline accounting
+  test_phase5.py  spec decoding vs greedy under self/hostile drafts, truncate
 scripts/
-  phase0_demo.py .. phase3_demo.py, benchmark.py
+  phase0_demo.py .. phase3_demo.py, phase5_demo.py, benchmark.py
 ```

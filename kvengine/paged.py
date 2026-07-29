@@ -257,6 +257,27 @@ class PagedSequenceCache:
         self._pending_slots = None
         self._pending_n = 0
 
+    def truncate(self, n_tokens: int) -> None:
+        """Roll back to n_tokens and return any blocks that are now entirely unused.
+
+        Where paging pays off a second time: rejecting drafted tokens is just
+        handing blocks back to the pool. A contiguous cache would have to keep the
+        whole reservation regardless.
+        """
+        if not 0 <= n_tokens <= self._length:
+            raise ValueError(f"cannot truncate to {n_tokens}, length is {self._length}")
+
+        keep = self.pool.manager.blocks_needed(n_tokens)
+        if keep < len(self.blocks):
+            self.pool.manager.free(self.blocks[keep:])
+            self.blocks = self.blocks[:keep]
+            self._block_ids = torch.tensor(
+                self.blocks, dtype=torch.long, device=self.pool.device
+            )
+        self._length = n_tokens
+        self._pending_slots = None
+        self._pending_n = 0
+
     # --- teardown ---
 
     def free(self) -> None:

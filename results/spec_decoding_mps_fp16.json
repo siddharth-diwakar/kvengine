@@ -1,0 +1,89 @@
+{
+  "environment": {
+    "target": "Qwen/Qwen2.5-3B",
+    "draft": "Qwen/Qwen2.5-0.5B",
+    "target_params": 3085938688,
+    "draft_params": 494032768,
+    "device": "mps:0",
+    "dtype": "torch.float16",
+    "platform": "macOS-15.7.3-arm64-arm-64bit-Mach-O",
+    "torch": "2.13.0",
+    "transformers": "5.14.1",
+    "timestamp_utc": "2026-07-29T22:33:59+00:00"
+  },
+  "config": {
+    "target": "Qwen/Qwen2.5-3B",
+    "draft": "Qwen/Qwen2.5-0.5B",
+    "device": "mps",
+    "dtype": "float16",
+    "k": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "max_new_tokens": 64,
+    "blocks": 512,
+    "block_size": 16,
+    "out": "results/spec_decoding_mps_fp16.json"
+  },
+  "baseline": {
+    "tokens": 384,
+    "elapsed_s": 17.637,
+    "tokens_per_s": 21.77
+  },
+  "sweep": [
+    {
+      "k": 1,
+      "tokens": 384,
+      "elapsed_s": 14.876,
+      "tokens_per_s": 25.81,
+      "speedup": 1.186,
+      "acceptance_rate": 0.8255,
+      "tokens_per_target_forward": 1.811,
+      "target_forwards": 212,
+      "mean_accepted_per_iter": 0.825,
+      "full_accept_iters": 0.825,
+      "exact_match": true
+    },
+    {
+      "k": 2,
+      "tokens": 384,
+      "elapsed_s": 11.673,
+      "tokens_per_s": 32.9,
+      "speedup": 1.511,
+      "acceptance_rate": 0.7662,
+      "tokens_per_target_forward": 2.494,
+      "target_forwards": 154,
+      "mean_accepted_per_iter": 1.532,
+      "full_accept_iters": 0.695,
+      "exact_match": true
+    },
+    {
+      "k": 4,
+      "tokens": 384,
+      "elapsed_s": 10.921,
+      "tokens_per_s": 35.16,
+      "speedup": 1.615,
+      "acceptance_rate": 0.6468,
+      "tokens_per_target_forward": 3.523,
+      "target_forwards": 109,
+      "mean_accepted_per_iter": 2.587,
+      "full_accept_iters": 0.532,
+      "exact_match": true
+    },
+    {
+      "k": 8,
+      "tokens": 384,
+      "elapsed_s": 13.082,
+      "tokens_per_s": 29.35,
+      "speedup": 1.348,
+      "acceptance_rate": 0.4832,
+      "tokens_per_target_forward": 4.683,
+      "target_forwards": 82,
+      "mean_accepted_per_iter": 3.866,
+      "full_accept_iters": 0.268,
+      "exact_match": true
+    }
+  ]
+}

@@ -16,6 +16,7 @@ from .forward import forward_with_own_cache
 from .loader import DEFAULT_MODEL, load_model, model_shape_info, pick_device
 from .paged import DEFAULT_BLOCK_SIZE, PagedKVCache, PagedSequenceCache
 from .reference import hf_greedy, strict_greedy_config
+from .speculative import SpecDecodeResult, speculative_greedy
 
 __all__ = [
     "AUTO_EOS",
@@ -33,7 +34,9 @@ __all__ = [
     "PagedSequenceCache",
     "Request",
     "RequestState",
+    "SpecDecodeResult",
     "StepInfo",
+    "speculative_greedy",
     "forward_decode_batch",
     "forward_with_own_cache",
     "plan_decode_batch",
