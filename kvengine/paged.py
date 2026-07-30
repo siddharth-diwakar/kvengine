@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import torch
 
-from .blocks import BlockManager, OutOfBlocks
+from .blocks import ROOT_DIGEST, BlockManager, OutOfBlocks, chain_digest
 from .loader import model_shape_info
 
 DEFAULT_BLOCK_SIZE = 16
@@ -137,6 +137,13 @@ class PagedSequenceCache:
         self._pending_slots: torch.Tensor | None = None
         self._pending_n = 0
 
+        # Phase 6 prefix sharing. _digest_chain[i] is the content address of this
+        # sequence's blocks 0..i; _registered is how many of our blocks have been
+        # published to the shared registry.
+        self._digest_chain: list[bytes] = []
+        self._registered = 0
+        self.tokens_reused = 0
+
     # --- state ---
 
     @property
@@ -183,9 +190,7 @@ class PagedSequenceCache:
             # Raises OutOfBlocks without mutating anything if the pool is full.
             new_blocks = self.pool.manager.allocate(extra, owner=self.request_id)
             self.blocks.extend(new_blocks)
-            self._block_ids = torch.tensor(
-                self.blocks, dtype=torch.long, device=self.pool.device
-            )
+            self._refresh_block_ids()
         self._pending_slots = self.slot_indices(self._length, n_tokens)
         self._pending_n = n_tokens
 
@@ -198,6 +203,85 @@ class PagedSequenceCache:
         pos = torch.arange(start, start + n_tokens, device=self.pool.device)
         block_slot = self._block_ids[pos // self.block_size]
         return block_slot * self.block_size + (pos % self.block_size)
+
+    # --- prefix sharing (phase 6) ---
+
+    def adopt_prefix(self, token_ids: list[int]) -> int:
+        """Reuse cached blocks for the longest shared prefix of token_ids.
+
+        Walks the prompt block by block, looking each up by content address, and
+        stops at the first miss — a prefix match must be contiguous from position
+        zero, because a block's identity is chained through every token before it.
+
+        Returns the number of tokens adopted. Those tokens already have their keys
+        and values in the cache, so the caller should prefill only
+        `token_ids[returned:]`.
+        """
+        assert self._length == 0 and not self.blocks, "adopt_prefix needs a fresh sequence"
+        bs = self.block_size
+
+        # Always leave at least one token to process. Prefill has to run over
+        # something to produce the logits that predict the next token, so a request
+        # that is an exact repeat of a cached one still recomputes its final block.
+        reusable = max(len(token_ids) - 1, 0)
+
+        parent = ROOT_DIGEST
+        adopted: list[int] = []
+        chain: list[bytes] = []
+        for i in range(reusable // bs):
+            chunk = token_ids[i * bs : (i + 1) * bs]
+            digest = chain_digest(parent, chunk)
+            block_id = self.pool.manager.lookup_prefix(digest, chunk)
+            if block_id is None:
+                break
+            adopted.append(block_id)
+            chain.append(digest)
+            parent = digest
+
+        if adopted:
+            self.pool.manager.incref(adopted)
+            self.blocks.extend(adopted)
+            self._digest_chain = chain
+            self._registered = len(adopted)
+            self._length = len(adopted) * bs
+            self._refresh_block_ids()
+
+        self.tokens_reused = self._length
+        return self._length
+
+    def register_prefix_blocks(self, token_ids: list[int]) -> int:
+        """Publish any of our blocks that are now full, so others can share them.
+
+        `token_ids` must be the tokens whose keys and values this cache holds, in
+        order. Only complete blocks are published: a partial block still has room
+        to grow, and sharing storage that is still being written to is precisely
+        the bug this design avoids.
+
+        Returns how many blocks were newly published.
+        """
+        bs = self.block_size
+        full_blocks = min(self._length // bs, len(token_ids) // bs, len(self.blocks))
+
+        # Extend the digest chain to cover every full block.
+        while len(self._digest_chain) < full_blocks:
+            i = len(self._digest_chain)
+            parent = self._digest_chain[-1] if self._digest_chain else ROOT_DIGEST
+            self._digest_chain.append(
+                chain_digest(parent, token_ids[i * bs : (i + 1) * bs])
+            )
+
+        published = 0
+        for i in range(self._registered, full_blocks):
+            chunk = token_ids[i * bs : (i + 1) * bs]
+            if self.pool.manager.register_prefix(self.blocks[i], self._digest_chain[i], chunk):
+                published += 1
+        self._registered = max(self._registered, full_blocks)
+        return published
+
+    def _refresh_block_ids(self) -> None:
+        self._block_ids = torch.tensor(
+            self.blocks, dtype=torch.long, device=self.pool.device
+        )
 
     # --- write / gather ---
 
@@ -267,13 +351,30 @@ class PagedSequenceCache:
         if not 0 <= n_tokens <= self._length:
             raise ValueError(f"cannot truncate to {n_tokens}, length is {self._length}")
 
+        bs = self.block_size
+        # Any block not wholly inside [0, n_tokens) may be rewritten after this, so
+        # its published contents are no longer final.
+        first_invalid = n_tokens // bs
+        for i in range(first_invalid, min(self._registered, len(self.blocks))):
+            block_id = self.blocks[i]
+            if self.pool.manager.refcount(block_id) > 1:
+                # Another sequence adopted this block. Rewriting it would corrupt
+                # their history, so refuse rather than silently corrupt. Reachable
+                # only by publishing blocks whose tokens were not yet final.
+                raise ValueError(
+                    f"block {block_id} is shared by another sequence; "
+                    f"cannot roll back into it"
+                )
+            self.pool.manager.unregister_prefix(block_id)
+
         keep = self.pool.manager.blocks_needed(n_tokens)
         if keep < len(self.blocks):
             self.pool.manager.free(self.blocks[keep:])
             self.blocks = self.blocks[:keep]
-            self._block_ids = torch.tensor(
-                self.blocks, dtype=torch.long, device=self.pool.device
-            )
+            self._refresh_block_ids()
+
+        self._registered = min(self._registered, first_invalid)
+        del self._digest_chain[first_invalid:]
         self._length = n_tokens
         self._pending_slots = None
         self._pending_n = 0
@@ -283,12 +384,18 @@ class PagedSequenceCache:
     def free(self) -> None:
         """Return every block to the pool. Idempotent, so double-retire is safe."""
         if self.blocks:
+            # Deliberately no unregister: published blocks keep their cached prefix
+            # and become reclaimable, which is what lets the *next* request with
+            # this prompt hit them.
             self.pool.manager.free(self.blocks)
             self.blocks = []
             self._block_ids = torch.empty(0, dtype=torch.long, device=self.pool.device)
         self._length = 0
         self._pending_slots = None
         self._pending_n = 0
+        self._digest_chain = []
+        self._registered = 0
+        self.tokens_reused = 0
 
     def __repr__(self) -> str:
         return (

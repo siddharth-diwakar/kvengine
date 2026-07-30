@@ -1,0 +1,53 @@
+{
+  "environment": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "device": "cpu",
+    "dtype": "float32",
+    "platform": "macOS-15.7.3-arm64-arm-64bit-Mach-O",
+    "torch": "2.13.0",
+    "transformers": "5.14.1",
+    "timestamp_utc": "2026-07-29T23:58:56+00:00"
+  },
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "device": "cpu",
+    "blocks": 256,
+    "block_size": 16,
+    "max_batch_size": 4,
+    "max_new_tokens": 24,
+    "out": "results/prefix_sharing_cpu.json"
+  },
+  "workload": {
+    "num_prompts": 6,
+    "shared_prefix_tokens": 63,
+    "prompt_tokens_total": 411
+  },
+  "concurrent": {
+    "prefill_tokens_off": 411,
+    "prefill_tokens_on": 155,
+    "prefill_tokens_saved": 256,
+    "prefill_saved_frac": 0.6229,
+    "prefix_tokens_reused": 256,
+    "prefix_block_hit_rate": 0.7619,
+    "prefix_block_evictions": 0,
+    "elapsed_s_off": 3.055,
+    "elapsed_s_on": 2.731,
+    "speedup": 1.119,
+    "tokens_generated": 128,
+    "output_identical": true
+  },
+  "sequential": {
+    "prefill_tokens_off": 822,
+    "prefill_tokens_on": 182,
+    "prefill_tokens_saved": 640,
+    "prefill_saved_frac": 0.7786,
+    "prefix_tokens_reused": 640,
+    "prefix_block_hit_rate": 0.8889,
+    "prefix_block_evictions": 0,
+    "elapsed_s_off": 6.139,
+    "elapsed_s_on": 5.904,
+    "speedup": 1.04,
+    "tokens_generated": 256,
+    "output_identical": true
+  }
+}

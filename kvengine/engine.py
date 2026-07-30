@@ -77,6 +77,11 @@ class Request:
     output_token_ids: list[int] = field(default_factory=list)
     seq: object | None = None
     finish_reason: str | None = None
+    # Whether this request's cache is caught up to prefill_input(). Tracked
+    # explicitly rather than derived from seq.length, because a request that
+    # adopts a shared prefix has a non-empty cache before it has ever run a
+    # forward pass -- and it still owes one to produce its first logits.
+    prefilled: bool = False
 
     # metrics, in scheduler steps
     arrival_step: int = 0
@@ -84,6 +89,7 @@ class Request:
     finish_step: int | None = None
     preemptions: int = 0
     prefill_tokens: int = 0  # includes tokens recomputed after preemption
+    prefix_tokens_reused: int = 0  # prompt tokens served from shared blocks
 
     # metrics, in wall-clock seconds. Steps are the right unit for reasoning about
     # scheduling; seconds are the only unit a latency SLO is written in.
@@ -184,6 +190,7 @@ class Engine:
         max_prefills_per_step: int = 1,
         prefill_first: bool = True,
         watermark_blocks: int = 1,
+        share_prefixes: bool = True,
     ):
         self.model = model
         self.pool = pool
@@ -194,6 +201,10 @@ class Engine:
         # for at least one step before it triggers a preemption. Admitting right
         # up to the last block guarantees thrashing.
         self.watermark_blocks = watermark_blocks
+        # Share KV blocks between requests with a common prompt prefix. Off makes
+        # the engine behave exactly as it did in phase 3, which is how the tests
+        # prove sharing changes no output.
+        self.share_prefixes = share_prefixes
 
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
@@ -299,6 +310,12 @@ class Engine:
             self.waiting.popleft()
             req.state = RequestState.RUNNING
             req.seq = self.pool.new_sequence(req.request_id)
+            req.prefilled = False
+            if self.share_prefixes:
+                # Adopt cached blocks for the longest shared prefix. This sets the
+                # sequence's length, and _run_prefills feeds only what is left --
+                # so the prefill saving falls out of the existing code.
+                req.prefix_tokens_reused += req.seq.adopt_prefix(req.prefill_input())
             self.running.append(req)
             admitted.append(req)
             info.admitted.append(req.request_id)
@@ -308,11 +325,11 @@ class Engine:
 
     def _decodable(self) -> list[Request]:
         """Running requests that have been prefilled and are ready for a decode."""
-        return [r for r in self.running if r.seq is not None and r.seq.length > 0]
+        return [r for r in self.running if r.seq is not None and r.prefilled]
 
     def _needs_prefill(self) -> list[Request]:
-        """Running requests whose cache is still empty."""
-        pending = [r for r in self.running if r.seq is not None and r.seq.length == 0]
+        """Running requests that still owe a prefill pass."""
+        pending = [r for r in self.running if r.seq is not None and not r.prefilled]
         return pending[: self.max_prefills_per_step]
 
     # --- prefill ---
@@ -326,7 +343,10 @@ class Engine:
         """
         for req in requests:
             tokens = req.prefill_input()
-            ids = torch.tensor([tokens], dtype=torch.long, device=self.pool.device)
+            # Skip whatever a shared prefix already provided. For a fresh sequence
+            # seq.length is 0 and this is the whole prompt.
+            todo = tokens[req.seq.length :]
+            ids = torch.tensor([todo], dtype=torch.long, device=self.pool.device)
             try:
                 logits = forward_with_own_cache(self.model, ids, req.seq)
             except OutOfBlocks:
@@ -340,8 +360,13 @@ class Engine:
                 self.waiting.appendleft(req)
                 continue
 
-            req.prefill_tokens += len(tokens)
+            req.prefilled = True
+            req.prefill_tokens += len(todo)
             info.prefilled.append(req.request_id)
+            if self.share_prefixes:
+                # Publish whatever blocks are now full, so later requests with this
+                # prompt can adopt them.
+                req.seq.register_prefix_blocks(tokens)
 
             if not req.is_resumed:
                 token = int(torch.argmax(logits[0, -1, :]))
@@ -388,6 +413,10 @@ class Engine:
         for req, token in zip(active, next_ids):
             req.output_token_ids.append(int(token))
             info.tokens_generated += 1
+            if self.share_prefixes and req.seq is not None:
+                # Generated tokens are shareable too: a follow-up turn in a chat
+                # repeats the whole prior exchange, not just the system prompt.
+                req.seq.register_prefix_blocks(req.prefill_input())
             if req.is_done():
                 self._retire(req, req.done_reason(), info)
 
@@ -402,6 +431,7 @@ class Engine:
         req.seq.free()
         req.seq = None
         req.state = RequestState.WAITING
+        req.prefilled = False
         req.preemptions += 1
         self.running.remove(req)
         # Front of the queue: it is the oldest work among the waiting, so it
@@ -464,4 +494,8 @@ class Engine:
                 else 0.0
             ),
             "prefill_tokens": sum(r.prefill_tokens for r in self.finished),
+            "prefix_tokens_reused": sum(r.prefix_tokens_reused for r in self.finished),
+            "prefix_block_hit_rate": round(self.pool.manager.prefix_hit_rate(), 4),
+            "prefix_block_evictions": self.pool.manager.evictions,
+            "blocks_reclaimable": self.pool.manager.num_reclaimable,
         }

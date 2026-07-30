@@ -86,8 +86,10 @@ jobs:
       # The project ships two attention implementations -- PyTorch's fused SDPA
       # kernel and the spelled-out reference -- and the benchmark numbers are only
       # meaningful if they agree. Re-run just the equivalence anchors on the
-      # unfused path rather than the whole suite twice.
+      # unfused path rather than the whole suite twice. "sharing" is in the filter
+      # because phase 6's anchor is also an output-identity claim: prefix sharing
+      # must change nothing, on either attention path.
       - name: Exact-match anchors on unfused attention
         env:
           KVENGINE_EAGER_ATTN: "1"
-        run: pytest -m slow -k "match or agree"
+        run: pytest -m slow -k "match or agree or sharing"

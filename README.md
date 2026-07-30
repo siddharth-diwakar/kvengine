@@ -20,17 +20,19 @@ model still works.
 | 3 | Continuous batching: scheduler, preemption, batched decode | done |
 | 4 | Scripted benchmark vs tuned HF baseline, results in JSON | done (T4 run pending) |
 | 5 | Speculative decoding: 0.5B draft for a 3B target | done |
+| 6 | Prefix sharing: refcounted blocks + content-addressed cache | done |
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest -m fast            # 24 tests, no weights, 0.05s
-.venv/bin/python -m pytest                    # 107 tests, ~2.5 min
+.venv/bin/python -m pytest -m fast            # 35 tests, no weights, 0.1s
+.venv/bin/python -m pytest                    # 127 tests, ~3 min
 .venv/bin/python scripts/phase2_demo.py       # memory: paging vs contiguous
 .venv/bin/python scripts/phase3_demo.py       # throughput: batched vs one-at-a-time
 .venv/bin/python scripts/benchmark.py --requests 24 --out results/local.json
 .venv/bin/python scripts/phase5_demo.py --dtype float16   # spec decoding k-sweep
+.venv/bin/python scripts/phase6_demo.py       # prefix sharing: prefill saved
 ```
 
 The Phase 5 sweep downloads Qwen2.5-3B (~6 GB). Pass
@@ -122,6 +124,30 @@ runs further from the target's own distribution, so acceptance falls (82.5% →
 draft is thrown away, and the draft passes that produced it are pure waste. The
 fraction of iterations where *all* k are accepted collapses from 82.5% to 26.8%,
 which is the clearest single indicator of where the knee is.
+
+**Prefix sharing.** 6 prompts behind a 63-token shared system prompt, Qwen2.5-0.5B
+fp32 on CPU, greedy. Output is byte-identical with sharing on and off.
+
+```
+                        prefill tokens    saved    block hit rate   wall clock
+concurrent (6 at once)      411 -> 155    62.3%             76.2%        1.12x
+sequential (each twice)     822 -> 182    77.9%             88.9%        1.04x
+```
+
+**The prefill saving is large and the wall-clock saving is not, which is the
+interesting part.** 62% of prefill work disappears, but total time barely moves,
+because on a 0.5B model at fp32 on CPU these prompts are short and decode
+dominates the run — cutting prefill cuts a small slice of the whole. Prefix
+caching pays in proportion to how prompt-heavy the traffic is, and this workload
+is not. The regimes where it actually wins are long system prompts, few-shot
+examples, and multi-turn chat where each turn re-sends the entire conversation;
+that is the same reason the number to watch is prefill tokens saved, not the
+speedup on this particular workload.
+
+The sequential row is the one that needed real machinery. Sharing between
+*concurrent* requests only needs a refcount. Sharing across requests that never
+overlap needs freed blocks to survive their owner, which is what the reclaimable
+state below is for.
 
 Utilization is the fraction of reserved cache memory actually holding real
 tokens. The contiguous scheme must reserve for the worst case *before* it knows
@@ -318,6 +344,55 @@ further from the target's distribution while drafting cost grows linearly. Repor
 only the first and speculative decoding always looks like it is winning — see the
 self-draft entry under gotchas for the extreme case.
 
+### Prefix sharing (`blocks.py`, `paged.py`)
+
+Two requests that begin with the same tokens compute the same keys and values for
+that span. Phase 6 makes them share the blocks instead, which is SGLang's
+RadixAttention idea implemented on top of the existing pager.
+
+**Blocks are reference counted, with three states.** A block is *free* (holds
+nothing), *reclaimable* (holds a cached prefix but nobody is using it), or
+*referenced* (one or more sequences are using it). `allocate()` spends free blocks
+before reclaimable ones, so a cached prefix is only discarded when the space is
+genuinely needed; when it must be, eviction is LRU. The reclaimable state is the
+whole reason sharing works across *sequential* requests — a finished request's
+blocks keep their contents and wait to be adopted rather than going straight back
+on the free list.
+
+**Blocks are found by content address, not by comparing prompts.** Each full block
+gets a blake2b digest of its tokens chained onto its predecessor's digest, so a
+block's identity depends on every token before it. That chaining is not decorative:
+RoPE bakes absolute position into the stored keys, so a block holding positions
+0-15 is not interchangeable with one holding the same tokens at 16-31, and an
+unchained hash would happily serve one for the other. Lookup also re-compares the
+tokens, because a digest collision would corrupt output silently rather than fail
+loudly.
+
+**Only full blocks are ever shared, which removes the need for copy-on-write.** A
+partially filled block still has room, so its owner will keep appending to it —
+sharing that means two requests writing to the same storage. A full block can never
+be written again, since the next token goes to the next block, so shared blocks are
+immutable by construction. vLLM needs CoW because it also shares partial blocks
+when forking a sequence for beam search or n>1 sampling; with one linear sequence
+per request, restricting sharing to full blocks deletes that entire class of bug
+for the cost of leaving up to `block_size - 1` tokens per request unshared.
+
+Matching is a contiguous prefix from position zero — walk the prompt block by
+block, stop at the first miss. There is no radix *tree* here; the digest chain plus
+a flat hash map gives prefix matching without the tree, at the cost of not being
+able to enumerate or share partial-block boundaries the way a real radix tree can.
+
+**A request always recomputes at least one token.** `adopt_prefix` deliberately
+leaves the final token unadopted, because prefill has to run over *something* to
+produce the logits that predict the next token. A request that is an exact repeat
+of a cached one still does one block of work.
+
+`check_invariants()` grew to cover the new states: free, reclaimable and referenced
+are disjoint, together they cover the pool exactly, a block is referenced iff its
+refcount is positive, and the two directions of the digest registry agree. A
+randomized churn test over allocate/incref/free/register/evict calls it after every
+operation.
+
 ### Testing and CI
 
 Tests are tagged `fast` or `slow` automatically, derived from whether a test
@@ -326,8 +401,8 @@ a new test classifies itself, and one can never drift into the fast suite and st
 silently downloading a model there.
 
 ```bash
-pytest -m fast   # 24 tests: allocator invariants, percentile maths, mask geometry
-pytest           # 107 tests
+pytest -m fast   # 35 tests: allocator invariants, percentile maths, mask geometry
+pytest           # 127 tests
 ```
 
 CI runs three things ([workflow](.github/workflows/ci.yml)):
@@ -383,6 +458,20 @@ nothing running. Admission now rejects anything that would not fit in an *empty*
 pool, and `step()` carries a backstop that aborts the queue head when a step is
 idle with nothing running. Both are tested.
 
+**Prefix sharing broke the scheduler by making a derived state variable lie.**
+The scheduler had no explicit notion of "this request has been prefilled" — it
+inferred it, reasonably, from `seq.length > 0`, since an un-prefilled request has
+an empty cache. Adopting a shared prefix gives a request a *non-empty cache before
+it has ever run a forward pass*, so every request that hit the prefix cache was
+classified as ready to decode, skipped prefill entirely, and crashed reaching for a
+first token it had never generated. The fix is an explicit `prefilled` flag set in
+`_run_prefills` and cleared on admission and preemption. Worth the space here
+because the failure was invisible until phase 6: phases 0-5 all passed, since their
+tests use distinct prompts and nothing is ever adopted. The general lesson is that
+a derived state variable encodes an assumption — here "empty cache implies no
+forward pass yet" — and a new feature can invalidate the assumption without
+touching any of the code that relies on it.
+
 **`padding_waste` depended on when it was called.** It derived history lengths
 from the live sequences, but `forward_decode_batch` commits, so the answer changed
 before vs after the forward pass. Lengths are now snapshotted at plan time. A
@@ -429,10 +518,12 @@ fused CUDA kernel that attends block-by-block and never materializes the history
 so it pays no extra memory traffic. This implementation is the honest portable
 version: correct, and slower by a constant. That constant is the 1.07x above.
 
-**No prefix sharing.** Two requests with a common prefix each get their own
-blocks. vLLM supports copy-on-write block sharing for exactly this; the block
-allocator here already tracks ownership, which is the hook that would need to
-become a reference count.
+**Prefix sharing, but no copy-on-write.** Phase 6 shares blocks between requests
+with a common prefix, and only full blocks are shareable, so shared storage is
+never written to. vLLM shares partial blocks too — needed when a sequence forks for
+beam search or n>1 sampling — and pays for it with a copy-on-write path. With one
+linear sequence per request there is nothing to fork, so that path is absent here
+rather than missing.
 
 **Decode batches are padded, not ragged.** vLLM's varlen kernels consume a ragged
 batch directly. Padding to the longest history wastes work proportional to the
@@ -454,7 +545,18 @@ a radix tree over token prefixes lets requests sharing a prefix share the cached
 KV for it, with LRU eviction. They compose: paging is a memory allocator, radix
 prefix caching is a cache with a hit rate. Paging always helps; radix caching
 helps in proportion to how much prefix traffic actually repeats (system prompts,
-few-shot examples, multi-turn chat).
+few-shot examples, multi-turn chat) — which the phase 6 numbers show directly, a
+62% cut in prefill work that moves wall clock by only 1.12x on a decode-dominated
+workload.
+
+Phase 6 implements the *caching* half without the tree: a chained digest per full
+block plus a flat hash map. That buys contiguous prefix matching from position
+zero, which is the case that matters for system prompts and multi-turn chat. What
+a real radix tree adds is structure — shared internal nodes across many divergent
+branches, and eviction decisions that understand which prefixes are ancestors of
+which. With a flat map, two prompts sharing 100 tokens and then diverging store one
+chain each up to the split, and the LRU has no idea one block is a prefix of
+another's chain. That is the honest gap between this and SGLang.
 
 ## Layout
 
@@ -471,7 +573,9 @@ kvengine/
   engine.py     phase 3: scheduler, admission, preemption, metrics
   bench.py      phase 4: workload generator, tuned HF baseline, metrics
   speculative.py phase 5: draft/verify loop with cache rollback
-results/        phases 4-5: committed benchmark JSON, one file per run
+  blocks.py     phase 6 also: refcounts, reclaimable state, prefix registry
+  paged.py      phase 6 also: adopt_prefix / register_prefix_blocks
+results/        phases 4-6: committed benchmark JSON, one file per run
 tests/
   test_phase0.py  exact match vs .generate()
   test_phase1.py  own cache, causal mask, chunked prefill
@@ -480,6 +584,7 @@ tests/
   test_phase3.py  batching invariance, ragged masks, preemption, rejection
   test_phase4.py  workload determinism, percentile maths, baseline accounting
   test_phase5.py  spec decoding vs greedy under self/hostile drafts, truncate
+  test_phase6.py  refcount churn, LRU eviction, sharing changes no output
 scripts/
-  phase0_demo.py .. phase3_demo.py, phase5_demo.py, benchmark.py
+  phase0_demo.py .. phase3_demo.py, phase5_demo.py, phase6_demo.py, benchmark.py
 ```
